@@ -1,26 +1,50 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import threading
 import time
-import asyncio
 from statistics import median
+import random
 import numpy as np
 from scipy.signal import welch
-from pylsl import StreamInlet, resolve_streams
-from collections import deque
+
+# Import pylsl for both outlet and inlet functionality.
+from pylsl import StreamInfo, StreamOutlet, StreamInlet, resolve_streams
 
 # --------------------
-# Configuration
+# Part 1: Simulated EEG Stream Outlet
 # --------------------
-SAMPLE_RATE = 500  # # samples/second
-NUM_CHANNELS = 8    # e.g., Fp1, Fp2, etc.
+def simulated_eeg_stream():
+    """
+    Simulate an EEG stream using LSL by continuously pushing random data.
+    Each sample is a list of 5 floating-point numbers.
+    """
+    # Create a new StreamInfo object.
+    info = StreamInfo(name="Simulated EEG", type="EEG", channel_count=5,
+                      nominal_srate=500, channel_format='float32', source_id="sim_eeg_01")
+    outlet = StreamOutlet(info)
+   
+    print("Simulated EEG stream outlet created and streaming data...")
+    while True:
+        # Generate 5 random values. Adjust the range if needed.
+        sample = [random.uniform(-150, 350) for _ in range(5)]
+        outlet.push_sample(sample)
+        # Wait to simulate a 500 Hz sampling rate.
+        time.sleep(1/500.0)
+
+# Start the simulated EEG stream in a background thread.
+sim_thread = threading.Thread(target=simulated_eeg_stream, daemon=True)
+sim_thread.start()
+
+# Allow a moment for the simulated stream to start.
+time.sleep(1)
 
 # --------------------
-# Resolve LSL Streams
+# Part 2: LSL Stream Inlet and FastAPI Server
 # --------------------
-print("Resolving available LSL streams...")
+print("Resolving all LSL streams...")
 streams = resolve_streams()  # Look for all available LSL streams
 
+# Loop through available streams and pick the one with type "EEG"
 inlet = None
 for s in streams:
     if s.type() == "EEG":
@@ -29,46 +53,62 @@ for s in streams:
         break
 
 if inlet is None:
-    print("No EEG stream of type 'EEG' found. Make sure the CGX device is streaming via LSL.")
+    print("No EEG stream of type 'EEG' found. Make sure the simulated EEG stream is running.")
 
 # --------------------
-# FastAPI App
+# FastAPI Setup
 # --------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust this to your frontend address if needed
+    allow_origins=["*"],  # Change this to restrict origins if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --------------------
-# Global State
+# Global State for Data and Computation
 # --------------------
-running = False
+running = False            # Whether we are currently reading data from LSL.
+data_buffer = []           # Storage for recent EEG samples.
+cog_load = 0.0             # Last computed cognitive load.
+SAMPLE_RATE = 500          # Approximate sampling rate (Hz).
 
-# We keep a separate buffer for each channel to compute Beta/Alpha ratio
-channel_buffers = [deque(maxlen=5 * SAMPLE_RATE) for _ in range(NUM_CHANNELS)]
-data_buffer = deque(maxlen=1000)  # Stores the "average ratio" for plotting
-buffer_lock = threading.Lock()
-
-cog_load_history = []
-start_time = None
-stop_time = None
-current_ratio = 0.0  # Current average ratio
+cog_load_history = []      # Stores computed cognitive load values over the session.
+start_time = None          # When EEG reading started.
+stop_time = None           # When EEG reading stopped.
 
 # --------------------
-# Cognitive Load (Ratio) Calculation
+# Reading Thread: Pulls data from the LSL inlet.
 # --------------------
-def compute_cognitive_load(channel_data):
+def read_eeg_thread():
+    global running, data_buffer, cog_load, cog_load_history, inlet
+    while running and inlet:
+        # Non-blocking sample pull (with a very short timeout)
+        sample, timestamp = inlet.pull_sample(timeout=0.0)
+        if sample:
+            data_buffer.append(sample)
+            # Once we have at least one second of samples, compute cognitive load.
+            if len(data_buffer) >= SAMPLE_RATE:
+                window_data = np.array(data_buffer[-SAMPLE_RATE:])
+                cog_load = compute_cognitive_load(window_data)
+                cog_load_history.append(cog_load)
+        time.sleep(0.001)  # Small sleep to prevent busy-waiting.
+
+# --------------------
+# Cognitive Load Calculation Function
+# --------------------
+def compute_cognitive_load(eeg_data):
     """
-    Compute Beta/Alpha ratio for a single channel_data array
-    using Welch's method. Return float ratio = BetaPower/AlphaPower.
+    Compute the ratio of Beta band power (13-30 Hz) to Alpha band power (8-12 Hz)
+    using channel 0.
+    eeg_data is expected to have shape (samples, channels).
     """
-    # f, psd from welch
-    f, psd = welch(channel_data, fs=SAMPLE_RATE, nperseg=128, noverlap=64)
+    channel0 = eeg_data[:, 0]  # Use the first channel for demonstration.
+    f, psd = welch(channel0, fs=SAMPLE_RATE, nperseg=256)
+    # Identify indices for Alpha and Beta frequency bands.
     alpha_idx = np.where((f >= 8) & (f <= 12))
     beta_idx  = np.where((f >= 13) & (f <= 30))
     alpha_power = np.sum(psd[alpha_idx])
@@ -78,124 +118,77 @@ def compute_cognitive_load(channel_data):
     return float(beta_power / alpha_power)
 
 # --------------------
-# Reading Thread: Pull EEG & Compute Ratio
-# --------------------
-def read_eeg_thread():
-    global running, channel_buffers, buffer_lock, current_ratio, cog_load_history, data_buffer
-
-    while running and inlet:
-        sample, timestamp = inlet.pull_sample(timeout=0.0)
-        if sample:
-            # We expect at least 8 channels. 
-            # Convert from microvolts to millivolts if needed.
-            scaled_sample = [ch_val / 1000.0 for ch_val in sample[:NUM_CHANNELS]]
-
-            # Add each channel's sample to the buffer
-            with buffer_lock:
-                for i in range(NUM_CHANNELS):
-                    channel_buffers[i].append(scaled_sample[i])
-
-                # Once we have at least 1 second of data for *each* channel, compute ratio
-                if all(len(cb) >= SAMPLE_RATE for cb in channel_buffers):
-                    ratio_sum = 0.0
-                    for i in range(NUM_CHANNELS):
-                        # Last second of data for channel i
-                        ch_data = np.array(list(channel_buffers[i])[-SAMPLE_RATE:])
-                        ratio_sum += compute_cognitive_load(ch_data)
-                    
-                    # Average ratio across all channels
-                    avg_ratio = ratio_sum / NUM_CHANNELS
-                    current_ratio = avg_ratio
-                    data_buffer.append(avg_ratio)
-                    cog_load_history.append(avg_ratio)
-
-        time.sleep(0.001)
-
-# --------------------
-# Start/Stop Endpoints
+# FastAPI Endpoints
 # --------------------
 @app.get("/")
 def root():
-    return {"message": "EEG server for Beta/Alpha ratio is running."}
+    return {"message": "EEG server is running."}
 
 @app.get("/start-eeg")
 def start_eeg():
-    global running, start_time, cog_load_history, data_buffer, channel_buffers
+    """
+    Start reading EEG data from the LSL stream.
+    Records the session start time and resets the data buffer.
+    """
+    global running, start_time, cog_load_history, data_buffer
     if not running:
         running = True
         start_time = time.strftime("%H:%M:%S")
-        # Clear old data
+        # Reset session data.
         cog_load_history = []
-        with buffer_lock:
-            data_buffer.clear()
-            for cb in channel_buffers:
-                cb.clear()
-
+        data_buffer = []
         t = threading.Thread(target=read_eeg_thread, daemon=True)
         t.start()
-        return {"status": "EEG started", "start_time": start_time}
-    else:
-        return {"status": "EEG already running", "start_time": start_time}
+    return {"status": "EEG started", "start_time": start_time}
 
 @app.get("/stop-eeg")
 def stop_eeg():
+    """
+    Stop reading EEG data, record the stop time, and provide session feedback
+    based on the median cognitive load.
+    """
     global running, stop_time, cog_load_history
     running = False
     stop_time = time.strftime("%H:%M:%S")
-
+   
     if cog_load_history:
         med_cog = median(cog_load_history)
     else:
         med_cog = 0.0
 
-    # Example threshold
-    threshold = 2.0
+    # Define a threshold for cognitive load feedback.
+    threshold = 1.0
     if med_cog > threshold:
         feedback = f"High cognitive load detected (median = {med_cog:.2f})."
     else:
-        feedback = f"Low/normal cognitive load detected (median = {med_cog:.2f})."
-
+        feedback = f"Low cognitive load detected (median = {med_cog:.2f})."
+   
     feedback_message = {
         "feedback": feedback,
         "start_time": start_time,
         "stop_time": stop_time,
         "median_cognitive_load": med_cog
     }
+   
     return {"status": "EEG stopped", "feedback": feedback_message}
 
 @app.get("/realtime")
 def realtime():
     """
-    Returns the last 20 ratio points plus the current ratio.
+    Return the most recent EEG data (last 20 samples) and the current cognitive load.
     """
-    with buffer_lock:
-        ratio_points = list(data_buffer)[-20:] if len(data_buffer) > 20 else list(data_buffer)
-        current_val = current_ratio
-    return {"ratio": ratio_points, "current_ratio": current_val}
+    global data_buffer, cog_load
+    last_samples = data_buffer[-20:] if len(data_buffer) > 20 else data_buffer
+    return {
+        "eeg": last_samples,
+        "cognitive_load": cog_load
+    }
 
 # --------------------
-# WebSocket for Real-Time Updates
-# --------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            with buffer_lock:
-                ratio_points = list(data_buffer)[-20:] if len(data_buffer) > 20 else list(data_buffer)
-                current_val = current_ratio
-            payload = {
-                "ratio": ratio_points,
-                "current_ratio": current_val
-            }
-            await websocket.send_json(payload)
-            await asyncio.sleep(1.0)
-    except WebSocketDisconnect:
-        print("WebSocket disconnected")
-
-# --------------------
-# Run via Uvicorn
+# Run the FastAPI server via uvicorn if executed directly.
 # --------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
