@@ -1,7 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-socketio
 pylsl
 scipy
 numpy
-starlette
